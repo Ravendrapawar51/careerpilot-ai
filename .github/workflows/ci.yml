@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+      AUTH_SECRET: ci-placeholder-secret-at-least-32-characters
+      AUTH_URL: https://careerpilot.example
+      CRON_SECRET: ci-cron-secret-at-least-24-characters
+      UPSTASH_REDIS_REST_URL: https://ci-rate-limit.example
+      UPSTASH_REDIS_REST_TOKEN: ci-rate-limit-token
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Validate production environment contract
+        run: npm run deploy:check
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Validate Prisma schema
+        run: npm run db:validate
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build
+
+  integration-e2e:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.5-pg16
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://ci:ci@127.0.0.1:5432/ci
+      AUTH_SECRET: ci-placeholder-secret-at-least-32-characters
+      AUTH_URL: http://127.0.0.1:3000
+      CRON_SECRET: ci-cron-secret-at-least-24-characters
+      INNGEST_DEV: "1"
+      UPSTASH_REDIS_REST_URL: https://ci-rate-limit.example
+      UPSTASH_REDIS_REST_TOKEN: ci-rate-limit-token
+      PLAYWRIGHT_BASE_URL: http://127.0.0.1:3000
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Validate production environment contract
+        run: npm run deploy:check
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Apply database migrations to local CI PostgreSQL
+        run: npm run db:deploy:local
+
+      - name: Verify migration history
+        run: npm run db:status:local
+
+      - name: Detect schema drift
+        run: npm run db:drift:local
+
+      - name: Database integration tests
+        run: npm run test:integration
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Critical browser flows
+        run: npm run test:e2e:ci
+
+      - name: Production load smoke
+        env:
+          LOAD_BASE_URL: http://127.0.0.1:3000
+          LOAD_DURATION_SECONDS: "10"
+          LOAD_CONCURRENCY: "10"
+          LOAD_MAX_P95_MS: "1000"
+          LOAD_MAX_ERROR_RATE: "0.01"
+        run: |
+          npm run build
+          npm run start -- --hostname 127.0.0.1 --port 3000 > /tmp/careerpilot-next.log 2>&1 &
+          server_pid=$!
+          trap 'kill $server_pid' EXIT
+          ready=0
+          for attempt in {1..60}; do
+            if curl --fail --silent --max-time 2 http://127.0.0.1:3000/api/health > /dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat /tmp/careerpilot-next.log
+            exit 1
+          fi
+          npm run load:smoke
+
+      - name: Upload Playwright diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
+          retention-days: 7
